@@ -86,3 +86,26 @@ E5 的 3×3 请求矩阵已有资格化尝试（1 completed、8 unplaceable）�
 * 裁决：若 mountain 也全部 unplaceable，结论只写“该第二路段未获得放置”；若有 qualified exposure，才比较路径可用率，UNKNOWN 保持 UNKNOWN。
 
 本扩展不改变论文安全结论，不放宽 strict、不倒车、不使用地图固定横向偏移作为成功。
+
+## 扩展-III（2026-10-11，反锚定 fixed_actual_pose）
+
+目的：不是声称偏移位姿能走，而是验证 `fixed_actual_pose` 契约能否在一个真实可放置起点上获得至少一组等曝光 qualified 证据。
+上一条 qualified baseline 的实际放置位姿为 `(x=779.4392068, y=734.5823346, heading=-13.107691°)`；本轮把它作为请求 anchor，
+`lateral=[0.0]`、`yaw=[0.0]`、位置容差 `0.10 m`、航向容差 `1°`，其余配置保持 town/sensor/strict/25s/6m/s/150s 不变。
+如果实际放置仍漂移超限，结果记 `unplaceable`；如果 contract 通过且 exposure >=24s，才记 qualified，
+并使用 request/session/result 记录的实际位姿与 UNKNOWN 字段。
+
+## 扩展-IV（2026-10-11，反向标定）
+
+目的：生产放置会沿感知车道重定中，不能直接把请求横向偏移当成固定实际位姿。本小轮只做请求→实际放置映射，
+不把它当驾驶结果：从已合格实际 anchor `(779.4392068,734.5823346,-13.107691°)` 沿道路方向前移
+`+5 m`、`+10 m`，用 `production_alignment`、8 s、`fixed_actual_pose` 关闭（先观察 actual pose），
+记录实际位置/航向偏差。若找到实际偏差≤0.10 m 且航向≤1°的前移请求，才用该请求以
+`fixed_actual_pose`、25 s 等曝光重跑一组；否则保留映射和失败原因，不强行制造合格结果。
+
+## 扩展-V（2026-10-11，反向标定后的 fixed_actual_pose 复测）
+
+扩展-IV 的 +5 m 请求完成了 `production_alignment` 观察，但实际放置为 `(787.0886022,732.8043141,-10.9186°)`，
+相对请求误差 2.853 m / 2.187°。本轮把该**实测 actual_pose**反向作为新请求 anchor，使用 `fixed_actual_pose`、
+位置容差 0.10 m、航向容差 1°、25 s/6 m/s/150 s、strict+sensor，跑 1 个等曝光位姿；若契约通过且 exposure 合格，
+这是一个反向标定得到的偏移起点观察，不把它与原请求偏移混为一谈。无论结果如何，保留完整 request/actual/UNKNOWN/失败原因。

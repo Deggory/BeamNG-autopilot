@@ -68,3 +68,22 @@ exposure-invalid；Mountain 4/4 unplaceable。论文因此只写「扩展边界�
 请求与实际放置偏差为：位置 `0.0215 m`、航向 `0.076°`，均在契约容差内；owned cleanup `closed=true`、
 `unverified=[]`、`still_running=[]`。这是一组合格的等曝光固定实际位姿观察，但它是**反锚定的 baseline 重复**，
 不是大偏移因果对照；大偏移与 mountain 的固定实际位姿批次仍分别为 4/4 rc=4 与 4/4 rc=3。
+
+## 7. 反向标定后的合格等曝光偏移（2026-10-11）
+
+扩展-IV 的 +5 m 请求 `production_alignment` 观察实际放置为 `(787.0886022,732.8043141,-10.9186°)`，
+请求误差为 2.853 m / 2.187°。将这个**实测 actual_pose**反向作为新请求 anchor，并用 `fixed_actual_pose`
+（位置容差 0.10 m、航向容差 1°）重跑：
+
+* `qualified=true`、`placement_rc=0`、`drive_started=true`、实际 elapsed 26.203 s；
+* 实际位置误差 **0.0209 m**、航向误差 **0.087°**；owned cleanup `closed=true`、无未验证/残留；
+* 42 帧、曝光跨度 24.186 s、净行进 **6.284 m**、最大速度 2.098 m/s；
+* 被接受路径 22 帧；感知车道来源 `sensor` 29 帧、`perception-unavailable` 13 帧；主因：无可用路径 18、
+  障碍很近 11、障碍接触风险 5。
+
+这是一组真正满足 fixed_actual_pose 与等曝光资格的**偏移起点观察**。它不是随机请求点与 baseline 的严格
+单因子 A/B（反向标定本身改变了 anchor），因此论文把它作为「契约可实现 + 偏移点可测」的证据，不写成
+大偏移导致的因果驾驶收益。
+
+结果目录：`logs/experiments/e5_reverse_cal_5m_20261011/`（映射）、
+`logs/experiments/e5_reverse_cal_fixed_20261011/`（合格 fixed 实测）。
