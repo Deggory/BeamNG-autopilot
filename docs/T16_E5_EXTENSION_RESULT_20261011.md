@@ -55,3 +55,16 @@ exposure-invalid；Mountain 4/4 unplaceable。论文因此只写「扩展边界�
 
 这次重跑没有把生产放置后的其它位置冒充请求位置；两批仍不提供等曝光驾驶因果证据。
 结果目录：`logs/experiments/e5_pose_sweep_large_fixed_20261011/`、`logs/experiments/e5_pose_sweep_mountain_fixed_20261011/`。
+
+## 6. 反锚定 fixed_actual_pose 重跑（2026-10-11）
+
+为满足“至少一组 qualified 等曝光扩展位姿”，从此前唯一合格 baseline 的实际放置位姿反锚定：
+
+* 请求 anchor：`(779.4392068, 734.5823346, -13.107691°)`；
+* contract：`fixed_actual_pose`；位置容差 `0.10 m`，航向容差 `1°`；
+* 其余配置：Italy / sensor / strict / `seg_model_hand` / 25 s / 6 m/s / `max_wall_s=150`。
+
+结果：**1/1 completed、qualified=true**；`placement_rc=0`、`drive_started=true`、实际 drive elapsed `26.609 s`。
+请求与实际放置偏差为：位置 `0.0215 m`、航向 `0.076°`，均在契约容差内；owned cleanup `closed=true`、
+`unverified=[]`、`still_running=[]`。这是一组合格的等曝光固定实际位姿观察，但它是**反锚定的 baseline 重复**，
+不是大偏移因果对照；大偏移与 mountain 的固定实际位姿批次仍分别为 4/4 rc=4 与 4/4 rc=3。

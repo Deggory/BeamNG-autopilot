@@ -510,8 +510,11 @@ perception lane frequently precedes path generation; sweep rejection is a separa
 is the principal reason in 8 of the 46 baseline frames. The larger-offset and mountain extensions were then rerun with the explicit `fixed_actual_pose` contract.
 All four larger-offset poses were rejected before exposure because production placement drifted by 2.57--3.08 m
 against the 0.10 m tolerance (`placement_rc=4`); all four mountain poses reached the placement deadline
-without equal-exposure drive measurement (`placement_rc=3`). These are placement-contract outcomes, not
-driving-quality or safety results, and neither extension supplies an equal-exposure comparison.
+without equal-exposure drive measurement (`placement_rc=3`). A re-anchored repeat at the previously observed
+actual baseline pose then **qualified**: position error 0.0215 m, heading error 0.076°, `placement_rc=0`,
+26.609 s drive elapsed, and owned cleanup verified. This is one qualified fixed-actual-pose observation,
+not a larger-offset causal comparison; the two extensions remain placement-contract outcomes, not driving-quality
+or safety results.
 
 Per-run traces, arm-level distributions and lane-placement distributions are in the supplement.
 Zero observed collisions, off-pavement frames and reversing in the four formal acceptance runs do not
