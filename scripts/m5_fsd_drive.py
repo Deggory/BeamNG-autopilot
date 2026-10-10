@@ -59,6 +59,16 @@ def main() -> int:
                     help="teleport to an open stretch before driving")
     ap.add_argument("--out", type=str, default=None,
                     help="path for per-frame JSON telemetry export")
+    ap.add_argument("--pose-contract", choices=("production_alignment", "fixed_actual_pose"),
+                    default="production_alignment",
+                    help="placement contract; fixed_actual_pose rejects pose drift before exposure")
+    ap.add_argument("--position-tolerance-m", type=float, default=0.10,
+                    help="fixed_actual_pose position tolerance in metres")
+    ap.add_argument("--heading-tolerance-deg", type=float, default=1.0,
+                    help="fixed_actual_pose heading tolerance in degrees")
+    ap.add_argument("--probe-geometry", action="store_true",
+                    help="record exact sensor boundaries, candidates, control path and grid; "
+                         "diagnostic overhead is reported separately")
     ap.add_argument("--lane-mode", choices=("map", "auto", "sensor"),
                     default="map",
                     help="lane-keep reference policy: map (rule-stable "
@@ -140,7 +150,11 @@ def main() -> int:
                          "+ BEV panel + HUD")
     ap.add_argument("--no-shadow", action="store_true",
                     help="disable shadow-episode recording during the drive")
+    ap.add_argument("--capture-range-replay", action="store_true",
+                    help="Tech-only: save one raw range input during warmup; requires --out")
     args = ap.parse_args()
+    if args.capture_range_replay and (args.runtime != "tech" or not args.out):
+        ap.error("--capture-range-replay requires --runtime tech and --out")
 
     return run(args)
 
