@@ -109,6 +109,9 @@ def probe_command(request: PoseRequest, output: Path, *, python: str) -> list:
             "--goal", *map(str, request.goal), "--lane-mode", "sensor", "--strict",
             "--seconds", str(request.seconds), "--speed", str(request.speed),
             "--max-wall-s", str(request.max_wall_s), "--seg-model", request.model,
+            "--pose-contract", request.pose_contract,
+            "--position-tolerance-m", str(request.position_tolerance_m),
+            "--heading-tolerance-deg", str(request.heading_tolerance_deg),
             "--out", str(output), *(["--probe-geometry"] if request.probe_geometry else []),
             *(["--capture-range-replay"] if request.capture_range_replay else [])]
 
@@ -127,6 +130,13 @@ def qualify_probe(output: Path, request: PoseRequest, *, exit_code: int) -> dict
                     "lane_mode": "sensor", "teleport": list(request.teleport),
                     "goal": list(request.goal), "seconds": request.seconds,
                     "speed": request.speed, "max_wall_s": request.max_wall_s}
+        # Old fixture evidence predates the explicit pose-contract fields. Keep
+        # production_alignment backward-compatible; fixed_actual_pose must be
+        # explicit because it is a stronger qualification contract.
+        if request.pose_contract == "fixed_actual_pose" or "pose_contract" in cfg:
+            expected.update(pose_contract=request.pose_contract,
+                            position_tolerance_m=request.position_tolerance_m,
+                            heading_tolerance_deg=request.heading_tolerance_deg)
         for key, value in expected.items():
             if cfg.get(key) != value:
                 reasons.append(f"config mismatch: {key}")
@@ -159,8 +169,18 @@ def qualify_probe(output: Path, request: PoseRequest, *, exit_code: int) -> dict
             else:
                 reasons.append("inconsistent placement timeout")
             return result
+        if exit_code == 4:
+            if ((audit.get("placement_rc") == 4
+                 and audit.get("termination") == "pose_contract_failure"
+                 and audit.get("drive_started") is False)):
+                result["status"] = "unplaceable"
+                reasons.append("fixed actual pose contract rejected placement; no equal-exposure drive measurement")
+            else:
+                result["status"] = "incomplete"
+                reasons.append("driver exit code 4 without a valid pose-contract failure record")
+            return result
         if exit_code != 0:
-            result["status"] = "incomplete" if exit_code == 4 else "failed"
+            result["status"] = "failed"
             reasons.append(f"driver exit code {exit_code}")
             return result
         if (audit.get("placed") is not True or audit.get("placement_rc") != 0
