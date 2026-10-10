@@ -43,3 +43,15 @@ Italy、strict + sensor、`seg_model_hand`、25 s、6 m/s、墙钟上限 150 s�
 
 E5 扩展已经**尝试完成**，但没有产生第二路段的合格驾驶证据：Italy 更大偏移批次有 2 个 qualified、2 个
 exposure-invalid；Mountain 4/4 unplaceable。论文因此只写「扩展边界与失败原因」，不把这些结果包装成泛化或安全提升。
+
+## 5. 固定实际位姿契约重跑（2026-10-11）
+
+为消除旧批次的 `production_alignment` 歧义，使用 `pose_contract=fixed_actual_pose`、位置容差 0.10 m、航向容差 1° 重跑：
+
+| 批次 | 请求数 | 结果 | 原因 |
+|---|---:|---|---|
+| Italy 更大偏移 | 4 | 4/4 `unplaceable` | `placement_rc=4`，生产放置位置漂移 2.57–3.08 m（固定实际位姿契约在曝光前拒绝） |
+| Mountain 第二路段 | 4 | 4/4 `unplaceable` | `placement_rc=3`，放置截止，无等曝光驾驶测量 |
+
+这次重跑没有把生产放置后的其它位置冒充请求位置；两批仍不提供等曝光驾驶因果证据。
+结果目录：`logs/experiments/e5_pose_sweep_large_fixed_20261011/`、`logs/experiments/e5_pose_sweep_mountain_fixed_20261011/`。

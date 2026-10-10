@@ -6,7 +6,7 @@
 - T17 感知节拍/几何诊断：代码回归与两臂 Tech 诊断完成；deadline、独立真值、ACK 等限制保留。
 - T18 传感器回放正确性：首轮无效保留、同协议重试合格、48 次同源输出一致、CPU p95 对比完成；定向/全量测试通过。
 - E5 基线 3×3 资格入口：9/9 尝试，1 completed、8 unplaceable；生产放置偏差与 exposure qualification 均记录。
-- E5 扩展：Italy 更大偏移 4/4 尝试（2 qualified、2 exposure-invalid）；mountain 第二路段 4/4 unplaceable；结果见 `docs/T16_E5_EXTENSION_RESULT_20261011.md`。
+- E5 扩展：先前 `production_alignment` 批次 2 qualified/2 exposure-invalid；随后用 `fixed_actual_pose` 契约重跑，Italy 更大偏移 4/4 在曝光前因 2.57–3.08m 漂移被拒（rc=4），mountain 第二路段 4/4 放置截止（rc=3）；结果见 `docs/T16_E5_EXTENSION_RESULT_20261011.md`。
 - 收尾后游戏进程为 0；当前纸面数字审计 115 项通过、图 QA 0、LaTeX 静态 0。
 
 ## 当前不能声称
@@ -20,4 +20,4 @@
 
 - 公开上传本地证据归档到 Zenodo（当前只生成 `logs/paper_release/` 本地 zip）。
 - ORCID、目标期刊、中文版是否投稿、邮箱是否放首页。
-- 更大偏移/第二路段若要形成等曝光驾驶因果证据，需要先修复生产放置契约与 Tech 启动/端口流程；当前结果只作为边界与失败原因记录。
+- 更大偏移/第二路段当前已用固定实际位姿契约阻止漂移后曝光；仍没有等曝光驾驶因果证据。下一步若要获得此证据，需要改变生产放置机制或选择能满足实际位姿容差的起点，并保持启动/端口流程。当前结果只作为边界与失败原因记录。

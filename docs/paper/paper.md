@@ -507,10 +507,11 @@ are not interchangeable. The old raw files remain historical evidence and are no
 measurements. A fixed-actual-pose experiment would require a placement contract that rejects pose drift
 before exposure, plus a clean restart between poses. Within the one completed observation, lack of a
 perception lane frequently precedes path generation; sweep rejection is a separate downstream event and
-is the principal reason in 8 of the 46 baseline frames. The larger-offset extension and the mountain
-second-link extension were also run through the same qualified entry: the larger-offset batch yielded
-two `completed` but exposure-invalid cases and two valid completions, while the mountain batch yielded
-four `unplaceable` results; neither batch supplies equal-exposure driving evidence.
+is the principal reason in 8 of the 46 baseline frames. The larger-offset and mountain extensions were then rerun with the explicit `fixed_actual_pose` contract.
+All four larger-offset poses were rejected before exposure because production placement drifted by 2.57--3.08 m
+against the 0.10 m tolerance (`placement_rc=4`); all four mountain poses reached the placement deadline
+without equal-exposure drive measurement (`placement_rc=3`). These are placement-contract outcomes, not
+driving-quality or safety results, and neither extension supplies an equal-exposure comparison.
 
 Per-run traces, arm-level distributions and lane-placement distributions are in the supplement.
 Zero observed collisions, off-pavement frames and reversing in the four formal acceptance runs do not
