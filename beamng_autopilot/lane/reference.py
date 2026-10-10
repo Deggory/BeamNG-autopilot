@@ -278,6 +278,17 @@ DIVIDER_MAX_CENTRE_OFFSET_M = 2.6
 # Fraction of sampled centre points that must land on drivable, observed
 # pavement before the shift may steer the car.
 DIVIDER_DRIVABLE_MIN_FRAC = 0.6
+# --- 铺装门只回答"在不在观测到的可行驶面上"（单因子开关，默认关）---------
+# 实测 2026-10-06（2 次 town、415 settled 帧）：被该门撤销的 202/202 帧**全部**由
+# obstacle 合取项触发，n_off_mask（观测到但不在可行驶掩码上）中位 0——即没有一帧是
+# 因为"中心不在可行驶面上"被撤销的。而 obstacle 层是 BEV 头的预测
+# （fsd_stack.py: `grid.obstacle[:] = (out.bev >= 0.6)`），于是该门在实车链上退化成
+# "BEV 头在车道中心误报障碍 → 撤掉整条车道" → plan_blocked=no_perception_lane
+# （119-175 帧/次）→ 无路径 → 停车，正是路径可用率只有 ~20-35% 的直接机制。
+# 打开后：车道接受只按可行驶掩码判定；obstacle 证据保留在诊断里，且所有**路径级**
+# 检查（path_blocked/占位、车体扫掠、风险层）一字不动。
+LANE_PAVEMENT_GATE_NO_OCC = os.environ.get(
+    "BEAMNG_LANE_PAVEMENT_GATE_NO_OCC", "0") != "0"
 
 
 def own_lane_beside_divider(markings, pos, heading, route_ref, grid,
@@ -428,8 +439,20 @@ def _median_lat_vs_ref(pts, ref, pos) -> float | None:
     return float(np.median(val[keep]))
 
 
-def _drivable_fraction(center, grid) -> tuple[float, int]:
-    """(fraction of sampled centre points on observed-drivable, samples)."""
+def _drivable_fraction(center, grid, *, pos=None,
+                       detail: dict | None = None,
+                       near_m: float = 8.0,
+                       ignore_obstacle: bool = False) -> tuple[float, int]:
+    """(fraction of sampled centre points on observed-drivable, samples).
+
+    ``detail`` (diagnostics only, optional): when given, it is filled with
+    the per-sample breakdown the single ``frac`` cannot show — how many
+    samples were unobserved / obstacle / non-drivable-mask, and the same
+    fraction restricted to the NEAR range (where the LiDAR evidence is
+    dense).  2026-10-06: 34% of paired frames are revoked by this gate
+    (frac < 0.6) and a single number cannot tell "the centre really is off
+    the pavement" apart from "the evidence is thin at the far end".
+    """
     if grid is None or center is None or len(center) < 2:
         return 0.0, 0
     drv = getattr(grid, "drivable", None)
@@ -438,28 +461,55 @@ def _drivable_fraction(center, grid) -> tuple[float, int]:
     if drv is None or not getattr(drv, "any", lambda: False)():
         return 0.0, 0
     pts = np.asarray(center, dtype=float)[:, :2]
-    rows, cols, ok = [], [], []
+    rows, cols, kept = [], [], []
     for x, y in pts:
         cell = grid.world_to_cell(float(x), float(y))
         if cell is None:
             continue
         rows.append(int(cell[0]))
         cols.append(int(cell[1]))
-        ok.append(True)
-    if not ok:
+        kept.append((float(x), float(y)))
+    if not kept:
         return 0.0, 0
     rr = np.asarray(rows)
     cc = np.asarray(cols)
+    # ``pts_in`` = exactly the polyline points that mapped into the grid;
+    # ``seen`` indexes THAT subset, not the full polyline (2026-10-06: the
+    # near-range diagnostic indexed pts[seen] and raised IndexError as soon
+    # as some points fell outside the grid — caught by the offline check).
+    pts_in = np.asarray(kept, dtype=float)
     if obs is not None and getattr(obs, "size", 0) and obs.shape == drv.shape:
         seen = obs[rr, cc] > 0
     else:
         # No observed layer: the drivable mask itself is the evidence.
         seen = np.ones(len(rr), dtype=bool)
     if int(seen.sum()) < 3:
+        if detail is not None:
+            detail.update({"n": int(seen.sum()), "n_unobserved": int((~seen).sum()),
+                           "n_obstacle": 0, "n_off_mask": 0, "frac_near": None,
+                           "n_near": 0})
         return 0.0, int(seen.sum())
     good = drv[rr[seen], cc[seen]] > 0
+    blocked = np.zeros(int(seen.sum()), dtype=bool)
     if occ is not None and getattr(occ, "size", 0) and occ.shape == drv.shape:
-        good = np.logical_and(good, occ[rr[seen], cc[seen]] == 0)
+        blocked = occ[rr[seen], cc[seen]] != 0
+        if not ignore_obstacle:
+            good = np.logical_and(good, ~blocked)
+    if detail is not None:
+        _d = {"n": int(seen.sum()), "n_unobserved": int((~seen).sum()),
+              "n_obstacle": int(blocked.sum()),
+              "n_off_mask": (int((~good).sum()) if ignore_obstacle
+                             else int((~good & ~blocked).sum())),
+              "obstacle_veto": (not ignore_obstacle)}
+        if pos is not None:
+            _p = np.asarray(pos, dtype=float).ravel()[:2]
+            _dpts = pts_in[seen]
+            _dd = np.linalg.norm(_dpts - _p[None, :], axis=1)
+            _near = _dd <= float(near_m)
+            _d["n_near"] = int(_near.sum())
+            _d["frac_near"] = (round(float(np.mean(good[_near])), 3)
+                               if int(_near.sum()) >= 3 else None)
+        detail.update(_d)
     return float(np.mean(good)), int(seen.sum())
 
 
@@ -930,7 +980,10 @@ def select_lane_reference(
         # shoulder.  The centre must lie where the sensors OBSERVED
         # drivable surface.  No grid / no observed evidence abstains
         # (recorded), and the check can only withdraw.
-        _drv_frac, _drv_n = _drivable_fraction(lane_ref, grid)
+        _drv_detail: dict = {}
+        _drv_frac, _drv_n = _drivable_fraction(
+            lane_ref, grid, pos=pos, detail=_drv_detail,
+            ignore_obstacle=LANE_PAVEMENT_GATE_NO_OCC)
         _drv_checked = bool(_drv_n >= 3)
         if _drv_checked and _drv_frac < DIVIDER_DRIVABLE_MIN_FRAC:
             _warn(warn, "lane_off_drivable",
@@ -943,7 +996,8 @@ def select_lane_reference(
             lane_width = 0.0
             gate_meta["lane_drivable"] = {
                 "frac": round(float(_drv_frac), 3), "n": int(_drv_n),
-                "reason": "centre off observed pavement"}
+                "reason": "centre off observed pavement",
+                **_drv_detail}
             # The revocation must kill the pre-gate booleans too.  Both
             # single-edge and divider fallbacks below re-publish the SAME
             # frame's geometry, so leaving them set re-labelled a revoked
@@ -956,7 +1010,8 @@ def select_lane_reference(
                 "frac": (round(float(_drv_frac), 3) if _drv_checked else None),
                 "n": int(_drv_n),
                 "reason": ("" if _drv_checked
-                           else "not enough observed samples")}
+                           else "not enough observed samples"),
+                **_drv_detail}
         if sensor_paired and lane_ref is not None and len(lane_ref) >= 3:
             lane_src_sel = SRC_SENSOR
         elif _single_vision:

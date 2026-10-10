@@ -191,6 +191,40 @@ ROAD_RECOVER_CONFIRM_S = float(
 PATH_HOLD_MAX_LAT_M = 2.5     # ego may not drift this far off the held path
 PATH_HOLD_MIN_AHEAD_M = 4.0   # the held path must still reach this far ahead
 PATH_HOLD_MIN_LEN_M = 6.0     # minimum usable offered trajectory length
+# --- bounded STATIONARY RECENTRE (option ②, single factor, default OFF) ----
+# Measured 2026-10-06 (12 town runs, 512 "planned vehicle body crosses" frames):
+# 96% of those frames have the car STATIONARY, the CURRENT body is inside the
+# lane in 512/512, and the planned sweep crosses at a median 2.50 m (509/512 in
+# 2-4 m, i.e. just inside the 4 m hard threshold) -- so a car parked crooked and
+# 0.86 m off the lane centre is refused every path and can never re-centre:
+# a static deadlock (stall_frac 0.93-1.0 across every arm measured).
+# With the switch ON a stationary car whose CURRENT body is inside the lane may
+# creep (minimal-risk speed x 0.5) while the crossing point is still at least
+# STATIONARY_RECENTRE_MIN_CLEAR_M ahead; a current crossing, a closer crossing,
+# a non-perception reference or stale sensors keep the original hard stop, and
+# the moment the car moves faster than STATIONARY_RECENTRE_MAX_SPEED_MPS the
+# exception stops applying, so it cannot be used to drive through a crossing.
+STATIONARY_RECENTRE = os.environ.get("BEAMNG_STATIONARY_RECENTRE", "0") != "0"
+STATIONARY_RECENTRE_MAX_SPEED_MPS = 0.3
+STATIONARY_RECENTRE_MIN_CLEAR_M = 2.0
+# --- hold window bounded by the T09 OBSERVATION contract (single factor) ---
+# Measured 2026-10-06 (town acceptance, 4 runs + 2 diagnostic runs): the
+# bounded hold was offered 24-50 times per run but reused on 1-5 frames, and
+# ~75% of the no-path frames reported "no hold offered" -- i.e. the hold had
+# already been CLEARED by its offer-age window (FSD_PATH_HOLD_MAX_S = 0.80 s)
+# long before the next drivable planner tick (the planner produced a drivable
+# path on only ~12-25% of ticks).  The T09 contract that this project already
+# pre-registered bounds a held path by *observation* freshness and *travel
+# since that observation* (HOLD_OBS_MAX_S / HOLD_TRAVEL_MAX_M in
+# planning.hold_audit) -- both still bounded, and both measured every tick by
+# the drive.  With this switch ON the hold is served past its offer age while
+# (and only while) that contract holds; it is still re-checked against the
+# CURRENT scene on every serve, the obstacle-risk layer still runs on it, and
+# the phase is forced to "creep" (never "grace"), so the car can only crawl at
+# the minimal-risk speed.  OFF by default: it changes when the car may move,
+# so it is A/B'd like every other gate here
+# (docs/T16_DRIVING_ROOTCAUSE_PREREG_20261006.md).
+HOLD_OBS_WINDOW = os.environ.get("BEAMNG_HOLD_OBS_WINDOW", "0") != "0"
 # --- current/planned body-cross split (improvement plan phase C1) ----
 # A PLANNED sweep crossing detected at least config.FSD_PLANNED_CROSS_
 # HARD_M along the path is a far-field risk: degrade (cap speed, let the
@@ -215,6 +249,7 @@ ARBITRATION_RULES: tuple[str, ...] = (
     "path_grazes",                   # degraded
     "lane_boundary_recovery",        # degraded
     "planned_boundary_crossing",     # degraded
+    "stationary_recentre",           # degraded
     "body_crosses_boundary",         # minimal_risk
     "path_off_lane",                 # minimal_risk
     "path_near_lane_edge",           # degraded
@@ -236,6 +271,7 @@ RULE_WORST_LEVEL: dict[str, str] = {
     "path_grazes": "degraded",
     "lane_boundary_recovery": "degraded",
     "planned_boundary_crossing": "degraded",
+    "stationary_recentre": "degraded",
     "body_crosses_boundary": "minimal_risk",
     "path_off_lane": "minimal_risk",
     "path_near_lane_edge": "degraded",
@@ -260,6 +296,7 @@ _REASON_TO_RULE: dict[str, str] = {
     "path grazes obstacle": "path_grazes",
     "lane boundary recovery": "lane_boundary_recovery",
     "planned boundary crossing ahead": "planned_boundary_crossing",
+    "stationary recentre creep": "stationary_recentre",
     "current vehicle body crosses lane boundary": "body_crosses_boundary",
     "planned vehicle body crosses lane boundary": "body_crosses_boundary",
     "path off-lane": "path_off_lane",
@@ -539,7 +576,10 @@ class PathHold:
             offered_at=float(now_s), strict=bool(strict))
         return True
 
-    def request(self, pos, now_s: float, *, refuse_out: list | None = None):
+    def request(self, pos, now_s: float, *, refuse_out: list | None = None,
+                observation_age_s: float | None = None,
+                travelled_since_obs_m: float | None = None,
+                obs_window: bool | None = None):
         """Serve the held path when still inside its bounded window.
 
         Returns ``(held, age_s, phase)`` with ``held`` the :class:`HeldPath`
@@ -551,19 +591,42 @@ class PathHold:
         refused, one short reason string is appended — the live drive
         records it so a "hold offered N times, reused M times" gap can be
         attributed instead of guessed (2026-10-06: 24 offers / 2 reuses).
+
+        ``obs_window`` (default: the module switch ``HOLD_OBS_WINDOW``):
+        when on, a hold older than ``max_s`` is still served while the T09
+        observation contract holds — ``observation_age_s`` fresh enough and
+        ``travelled_since_obs_m`` short enough — and the phase is forced to
+        ``"creep"``.  Neither quantity is invented: when either is missing
+        the hold is refused exactly as before.
         """
         def _no(reason: str):
             if refuse_out is not None:
                 refuse_out.append(reason)
             return None
 
+        use_obs = HOLD_OBS_WINDOW if obs_window is None else bool(obs_window)
         held = self._held
         if held is None:
             return _no("no hold offered")
         age = max(0.0, float(now_s) - held.offered_at)
-        if age > self.max_s:
-            self._held = None
-            return _no(f"expired (age {age:.2f}s > {self.max_s:.2f}s)")
+        stale_offer = age > self.max_s
+        if stale_offer:
+            if not use_obs:
+                self._held = None
+                return _no(f"expired (age {age:.2f}s > {self.max_s:.2f}s)")
+            from beamng_autopilot.planning.hold_audit import (
+                HOLD_OBS_MAX_S, HOLD_TRAVEL_MAX_M,
+            )
+            if observation_age_s is None:
+                return _no("expired: observation age unknown")
+            if float(observation_age_s) > float(HOLD_OBS_MAX_S):
+                return _no(f"expired: observation {float(observation_age_s):.2f}s "
+                           f"> {float(HOLD_OBS_MAX_S):.2f}s")
+            if travelled_since_obs_m is None:
+                return _no("expired: travel since observation unknown")
+            if float(travelled_since_obs_m) > float(HOLD_TRAVEL_MAX_M):
+                return _no(f"expired: travelled {float(travelled_since_obs_m):.1f}m "
+                           f"> {float(HOLD_TRAVEL_MAX_M):.1f}m")
         p = np.asarray(pos, dtype=float).ravel()[:2]
         pts = held.path
         d = np.linalg.norm(pts - p[None, :], axis=1)
@@ -574,7 +637,11 @@ class PathHold:
             np.linalg.norm(np.diff(pts, axis=0), axis=1))])
         if float(arc[-1] - arc[j]) < self.min_ahead_m:
             return _no(f"only {float(arc[-1] - arc[j]):.2f}m of path ahead")
-        phase = "grace" if age <= self.grace_s else "creep"
+        # A hold served past its offer age may only CRAWL: the "grace" phase
+        # keeps the originally offered target, which was verified against a
+        # scene that is now seconds old.
+        phase = ("grace" if (age <= self.grace_s and not stale_offer)
+                 else "creep")
         return held, age, phase
 
     def clear(self) -> None:
@@ -782,7 +849,9 @@ class SafetyMonitor:
             now_s=(time.time() if now_s is None else float(now_s)),
             strict=strict)
 
-    def _serve_hold(self, scene, now_s: float, *, refuse_out: list | None = None):
+    def _serve_hold(self, scene, now_s: float, *, refuse_out: list | None = None,
+                    observation_age_s: float | None = None,
+                    travelled_since_obs_m: float | None = None):
         """Re-check the held path against the CURRENT scene, then serve.
 
         The held trajectory was verified when it was offered; the world
@@ -794,6 +863,8 @@ class SafetyMonitor:
         ``(held_path, age_s, phase, target_speed)`` or None.
 
         ``refuse_out`` (diagnostics only, optional): the refusal reason.
+        ``observation_age_s`` / ``travelled_since_obs_m`` feed the T09
+        observation window when ``HOLD_OBS_WINDOW`` is on.
         """
         def _no(reason: str):
             if refuse_out is not None:
@@ -802,7 +873,8 @@ class SafetyMonitor:
 
         req = self.path_hold.request(
             np.asarray(scene.pos[:2], dtype=float), now_s,
-            refuse_out=refuse_out)
+            refuse_out=refuse_out, observation_age_s=observation_age_s,
+            travelled_since_obs_m=travelled_since_obs_m)
         if req is None:
             return None
         held, age, phase = req
@@ -888,7 +960,9 @@ class SafetyMonitor:
     def evaluate(self, scene, path, closed_loop_steer: float = 0.0,
                  snapshot_age_s: float = 0.0, planner_age_s: float = 0.0,
                  now_s: float | None = None,
-                 ego_speed_mps: float | None = None) -> SafetyVerdict:
+                 ego_speed_mps: float | None = None,
+                 observation_age_s: float | None = None,
+                 travelled_since_obs_m: float | None = None) -> SafetyVerdict:
         """Arbitrate one tick.
 
         ``scene`` is a ``planning.Scene`` (occupancy grid + route/lane).
@@ -898,6 +972,10 @@ class SafetyMonitor:
         the bounded PATH_HOLD phases (tests pass an explicit value; live
         callers use the wall clock).  ``ego_speed_mps`` feeds the
         obstacle TTC model (closing speed is relative to the ego).
+        ``observation_age_s`` / ``travelled_since_obs_m`` are the T09
+        observation-contract inputs for the bounded PATH_HOLD: they are
+        only consulted when ``HOLD_OBS_WINDOW`` is on, and a missing value
+        refuses the hold instead of being guessed.
 
         The obstacle risk layer is applied LAST, on whatever verdict the
         core arbitration produced: a degraded branch (scattered clutter,
@@ -908,7 +986,9 @@ class SafetyMonitor:
         """
         v = self._evaluate_core(scene, path, closed_loop_steer,
                                 snapshot_age_s, planner_age_s, now_s,
-                                ego_speed_mps)
+                                ego_speed_mps,
+                                observation_age_s=observation_age_s,
+                                travelled_since_obs_m=travelled_since_obs_m)
         risk_path = v.held_path if v.path_hold_active else path
         v.rules_evaluated.append("obstacle_risk")
         # Keep the legacy stationary risk estimate for callers without
@@ -1107,7 +1187,9 @@ class SafetyMonitor:
                        snapshot_age_s: float = 0.0,
                        planner_age_s: float = 0.0,
                        now_s: float | None = None,
-                       ego_speed_mps: float | None = None) -> SafetyVerdict:
+                       ego_speed_mps: float | None = None,
+                       observation_age_s: float | None = None,
+                       travelled_since_obs_m: float | None = None) -> SafetyVerdict:
         """Evaluate hard checks even after a soft limit has fired."""
         closed_loop_steer = float(closed_loop_steer)
         freshness = _perception_freshness(scene, snapshot_age_s)
@@ -1128,7 +1210,9 @@ class SafetyMonitor:
         if (path is None or len(path) < 2) and not stale_sensor and not stale_planner:
             served = self._serve_hold(
                 scene, time.time() if now_s is None else float(now_s),
-                refuse_out=_hold_refuse)
+                refuse_out=_hold_refuse,
+                observation_age_s=observation_age_s,
+                travelled_since_obs_m=travelled_since_obs_m)
             if served is not None:
                 path = served[0]
         path_occ = self._path_occupied_fraction(scene, path)
@@ -1345,8 +1429,21 @@ class SafetyMonitor:
         if far_crossing:
             self._cap_verdict(v, self.min_risk_speed * 2.0,
                               "planned boundary crossing ahead")
+        v.rules_evaluated.append("stationary_recentre")
+        _ego_speed = (0.0 if ego_speed_mps is None else float(ego_speed_mps))
+        stationary_recentre = bool(
+            STATIONARY_RECENTRE
+            and not body_now_cross
+            and body_cross > 0.0
+            and float(body_cross) >= STATIONARY_RECENTRE_MIN_CLEAR_M
+            and _ego_speed <= STATIONARY_RECENTRE_MAX_SPEED_MPS
+            and lane_ref_src == REF_SENSOR
+            and not stale_sensor and not stale_planner)
+        if stationary_recentre:
+            self._cap_verdict(v, self.min_risk_speed * 0.5,
+                              "stationary recentre creep")
         v.rules_evaluated.append("body_crosses_boundary")
-        if (body_now_cross or body_cross > 0.0) and not recovery and not far_crossing:
+        if (body_now_cross or body_cross > 0.0) and not recovery and not far_crossing                 and not stationary_recentre:
             v.level = "minimal_risk"
             v.reason = ("current vehicle body crosses lane boundary"
                         if body_now_cross

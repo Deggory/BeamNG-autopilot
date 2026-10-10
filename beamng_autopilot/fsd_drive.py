@@ -9,8 +9,10 @@ telemetry flow driven by the parsed CLI arguments.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -102,6 +104,7 @@ from beamng_autopilot.watchdog import (
     heartbeat as wd_heartbeat,
 )
 from beamng_autopilot.vision.lanes import (
+    PLC_ON_SENSOR_LANE,
     PaintedLineLateralCorrector,
     painted_line_correction_active,
     painted_line_direction,
@@ -1987,17 +1990,26 @@ class FSDriveSession:
             except Exception as _dqn_e:
                 print(f"[fsd-drive] DQN policy disabled: {_dqn_e}")
                 dqn_rt = None
+        stack.probe_geometry = bool(getattr(args, "probe_geometry", False))
+        if getattr(args, "capture_range_replay", False):
+            if stack.mode != "tech" or not args.out:
+                raise ValueError("range replay capture requires Tech and --out")
+            stack.range_prov.arm_replay_capture(Path(args.out).parent / "range_replay")
         return rule_planner, stack, e2e_rt, bc_rt, dqn_rt
 
-    def _prewarm_and_place(self, conn, stack, nav_route, fwd_gear):
+    def _prewarm_and_place(self, conn, stack, nav_route, fwd_gear,
+                           *, wall_hit=None):
         """Warm sensors and place the ego using perception-only geometry.
 
         The vehicle remains braked while expensive heads warm and while
         painted-line placement retries.  The method returns ``(tick,
         placed, abort_code)``; it contains no planner/control-loop state.
+        ``wall_hit`` shares the session's monotonic deadline.  Check both
+        before and after a blocking sensor tick, before releasing brakes.
         """
         _pw_out = None
         _percep_ok = False
+        _wall_hit = wall_hit if wall_hit is not None else lambda: False
         _strict_sensor = bool(
             getattr(self.args, "strict", False)
             and str(getattr(self.args, "lane_mode", "")) == "sensor")
@@ -2008,6 +2020,10 @@ class FSDriveSession:
             _pw_ticks = 0
             _pw_teleported = False
             while True:
+                if _wall_hit():
+                    print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
+                          flush=True)
+                    return _pw_out, False, 3
                 _elapsed = time.time() - _pw_t0
                 try:
                     wd_heartbeat(conn)
@@ -2022,6 +2038,10 @@ class FSDriveSession:
                     _pw_ticks += 1
                 except Exception:
                     _pw_out = None
+                if _wall_hit():
+                    print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
+                          flush=True)
+                    return _pw_out, False, 3
                 _head_live = bool(
                     _pw_out is not None
                     and _pw_out.meta.get("object_head"))
@@ -2198,6 +2218,12 @@ class FSDriveSession:
                   f"{time.time() - _pw_t0:.1f}s, "
                   f"object_head={bool(_pw_out is not None and _pw_out.meta.get('object_head'))}, "
                   f"placed={_percep_ok}")
+            # Deadline has priority over collection-mode allow_unplaced: a timed-out
+            # placement must never be reclassified as a successful unplaced run.
+            if _wall_hit():
+                conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                             parkingbrake=1.0, gear=fwd_gear)
+                return _pw_out, False, 3
             if not _percep_ok:
                 _strict_sensor = bool(
                     getattr(self.args, "strict", False)
@@ -2223,6 +2249,8 @@ class FSDriveSession:
                              parkingbrake=1.0, gear=fwd_gear)
                 conn.step(3)
                 return _pw_out, False, 2
+            if _wall_hit():
+                return _pw_out, False, 3
             conn.control(throttle=0.0, brake=0.0, steering=0.0,
                          parkingbrake=0.0, gear=fwd_gear)
             conn.step(3)
@@ -2231,11 +2259,36 @@ class FSDriveSession:
             except Exception:
                 pass
         except Exception as _pw_e:
-            print(f"[fsd-drive] pre-warm skipped: {_pw_e}")
+            print(f"[fsd-drive] ABORT: pre-warm/placement failed: {_pw_e}",
+                  flush=True)
+            try:
+                conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                             parkingbrake=1.0, gear=fwd_gear)
+            except Exception:
+                pass
+            return _pw_out, False, 2
         return _pw_out, _percep_ok, 0
 
     def run(self) -> int:
         args = self.args
+        # 整轮墙钟上限（--max-wall-s）：见 m5_fsd_drive 的说明。默认 None，行为与既有运行一致。
+        _wall_t0 = time.monotonic()
+        _wall_max = getattr(args, "max_wall_s", None)
+        _wall_hit = lambda: bool(_wall_max) and (time.monotonic() - _wall_t0) >= float(_wall_max)
+        _run_config = json.loads(json.dumps(vars(args), default=str))
+        _run_record = {
+            "schema": "fsd-session-v1", "config": _run_config,
+            "config_hash": hashlib.sha256(json.dumps(
+                _run_config, sort_keys=True).encode()).hexdigest(),
+            "requested_pose": getattr(args, "teleport", None),
+            "placed": False, "placement_rc": None, "actual_pose": None,
+            "drive_started": False, "drive_elapsed_s": 0.0,
+            "exit_code": 2, "termination": "setup_failure",
+            "cleanup": None,
+        }
+        from beamng_autopilot.experiments.reproducibility import source_snapshot
+        _run_record["source_before"] = source_snapshot(config.PROJECT_ROOT)
+        _drive_monotonic_t = None
 
         # initialised FIRST: the end-of-run finally touches these even when
         # the connection fails before the drive section (2026-09-06:
@@ -2272,18 +2325,23 @@ class FSDriveSession:
         pp = PurePursuit(lookahead=5.0)
         speed_ctrl = SpeedController(deadband=SPEED_DEADBAND_MPS,
                                     hyst_mps=SPEED_HYST_MPS)
-        monitor = SafetyMonitor(max_speed=args.speed)
+        monitor = SafetyMonitor(max_speed=args.speed,
+                                capture_geometry=bool(getattr(args, "probe_geometry", False)))
         try:
             _launch_t = time.time()
             conn.open(launch=not args.attach)
-            try:
-                conn.attach_vehicle(already_open=True)
-                if getattr(args, "map", None):
-                    # attach 只挂到游戏当前关卡（昨天留在 italy 的实例被
-                    # 原样驱动了一整集）——显式 --map 时强制加载该地图场景
-                    conn.load_scenario()
-            except Exception:
+            if not args.attach:
+                # A newly launched game has no active scenario yet. Load the
+                # requested map before issuing any current-vehicle RPC.
                 conn.load_scenario()
+            else:
+                try:
+                    conn.attach_vehicle(already_open=True)
+                    if getattr(args, "map", None):
+                        # Explicit map requests replace the attached level.
+                        conn.load_scenario()
+                except Exception:
+                    conn.load_scenario()
             if args.teleport is not None:
                 x, y, yaw = args.teleport
                 # Ground-safe teleport: the connector measures the real surface
@@ -2304,8 +2362,8 @@ class FSDriveSession:
             # never leaves the car in reverse; keep the D input on every
             # control frame so an impact can never leave the gearbox in R.
             fwd_gear = gearbox.forward_gear_input(conn)
-            conn.control(throttle=0.0, brake=0.0, steering=0.0,
-                         parkingbrake=0.0, gear=fwd_gear)
+            conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                         parkingbrake=1.0, gear=fwd_gear)
             conn.step(3)
             # Game-side input watchdog: if this Python process dies or is
             # killed, the game keeps applying the last controls - the Lua
@@ -2361,10 +2419,64 @@ class FSDriveSession:
                         dqn_rt.meta_warning
                         if dqn_rt is not None else None),
                 ))
-            (_pw_out, _percep_ok,
-             _placement_rc) = self._prewarm_and_place(
-                conn, stack, nav_route, fwd_gear)
+            try:
+                (_pw_out, _percep_ok,
+                 _placement_rc) = self._prewarm_and_place(
+                    conn, stack, nav_route, fwd_gear, wall_hit=_wall_hit)
+            finally:
+                if getattr(args, "capture_range_replay", False):
+                    _run_record["range_replay"] = stack.range_prov.disarm_replay_capture()
+                    _run_record["range_replay"]["disarmed_wall_t"] = time.time()
+            _run_record.update(placed=bool(_percep_ok), placement_rc=_placement_rc,
+                               termination="placement_failure")
+            try:
+                _placed_state = conn.get_state()
+                _run_record["actual_pose"] = {
+                    "pos": [float(v) for v in _placed_state.pos],
+                    "heading_rad": float(_placed_state.heading),
+                }
+            except Exception as _pose_e:
+                _run_record["pose_error"] = str(_pose_e)
+            # Fixed-actual-pose contract: production placement must be within the
+            # requested tolerance **before exposure starts**.  A shifted production
+            # pose is a qualification failure, never a drive measurement under the
+            # requested pose (E5 audit).
+            if (not _placement_rc
+                    and getattr(args, "pose_contract", "production_alignment")
+                    == "fixed_actual_pose"):
+                _actual = _run_record.get("actual_pose") or {}
+                _req = getattr(args, "teleport", None)
+                try:
+                    _ap = np.asarray(_actual.get("pos", []), dtype=float)
+                    _ah = float(_actual.get("heading_rad"))
+                    _shift = float(np.linalg.norm(_ap[:2] - np.asarray(_req[:2], dtype=float)))
+                    _yaw_err = abs((math.degrees(_ah) - float(_req[2]) + 180.0) % 360.0 - 180.0)
+                    _run_record["pose_contract_check"] = {
+                        "contract": "fixed_actual_pose", "position_error_m": _shift,
+                        "heading_error_deg": _yaw_err,
+                        "position_tolerance_m": float(getattr(args, "position_tolerance_m", 0.10)),
+                        "heading_tolerance_deg": float(getattr(args, "heading_tolerance_deg", 1.0)),
+                    }
+                    if (_shift > float(getattr(args, "position_tolerance_m", 0.10))
+                            or _yaw_err > float(getattr(args, "heading_tolerance_deg", 1.0))):
+                        print("[fsd-drive] fixed_actual_pose contract failed before exposure: "
+                              f"shift={_shift:.3f}m yaw_error={_yaw_err:.2f}deg", flush=True)
+                        _run_record.update(placed=False, placement_rc=4,
+                                           termination="pose_contract_failure",
+                                           exit_code=4, drive_started=False)
+                        conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                     parkingbrake=1.0, gear=fwd_gear)
+                        conn.step(3)
+                        return 4
+                except (TypeError, ValueError, IndexError, KeyError):
+                    _run_record.update(placed=False, placement_rc=4,
+                                       termination="pose_contract_failure",
+                                       exit_code=4, drive_started=False,
+                                       pose_contract_check={"contract": "fixed_actual_pose",
+                                                            "valid": False})
+                    return 4
             if _placement_rc:
+                _run_record["exit_code"] = _placement_rc
                 return _placement_rc
             if not _percep_ok:
                 print("[fsd-drive] painted line not perceived; keeping the "
@@ -2434,6 +2546,9 @@ class FSDriveSession:
             sig_rule_t = 0.0        # last road-link signal poll time
             rev_thr = REV_THR_BASE  # reverse-escape throttle ramp state
             t_end = time.time() + args.seconds
+            _drive_monotonic_t = time.monotonic()
+            _run_record.update(drive_started=True, drive_started_wall_t=time.time(), exit_code=0,
+                               termination="completed")
             frames = 0
             stopps = 0
             hold_frames = 0
@@ -2518,6 +2633,10 @@ class FSDriveSession:
             _ema_tick = 0.35          # adaptive tick-budget EMA (seeded: a
                                       # typical warm tick is ~0.3-0.4 s)
             while time.time() < t_end:
+                if _wall_hit():
+                    print("[fsd-drive] 墙钟上限到达（行驶阶段）：结束本轮", flush=True)
+                    _run_record.update(exit_code=4, termination="drive_wall_timeout")
+                    break
                 try:
                     if not wd_heartbeat(conn):
                         watchdog_lost = True
@@ -2560,6 +2679,9 @@ class FSDriveSession:
                 _wall_dt = max(0.0, now_t - last_t)
                 last_t = now_t
                 dt = min(0.5, max(0.05, _wall_dt))
+                # F-C：本 tick 的 PLC 前置位移（None = 未跑；下游复用，避免
+                # 同一个 tick 里把限速器推进两次）
+                self._plc_pre_shift = None
                 # Long-tick brake guard: if the PREVIOUS tick took too long
                 # the car just drove open-loop for that long.  Brake now
                 # (before the next, possibly long, tick) so no more distance
@@ -2654,6 +2776,11 @@ class FSDriveSession:
                 out = stack.tick(st=st, route_ref=route_local,
                                  map_lane_override=map_lane,
                                  time_budget_s=_budget)
+                if _wall_hit():
+                    _run_record.update(exit_code=4, termination="drive_wall_timeout")
+                    print("[fsd-drive] 墙钟上限到达（感知返回后）：制动收尾",
+                          flush=True)
+                    break
                 if (not _percep_ok
                         and _sensor_lane_is_centered(out, pos,
                                                      heading)):
@@ -2741,6 +2868,68 @@ class FSDriveSession:
                 # safety lateral check while the planner used the own lane).
                 # The rebuild below survives only as the fallback for stubs
                 # that publish no Scene (docs/fsd_realism.md §2/§4).
+                # T09 observation-contract inputs for the bounded hold
+                # (BEAMNG_HOLD_OBS_WINDOW): the age of the last REAL
+                # perception observation and how far the car has driven
+                # since it.  Computed BEFORE the arbitration because the
+                # monitor consults them when a tick loses its path; the
+                # audit below reuses the same numbers instead of counting
+                # the travel twice.
+                try:
+                    _sh0 = out.meta.get("lane_shadow") or {}
+                    _obs_age = (_sh0.get("age_since_update_s")
+                                if isinstance(_sh0, dict) else None)
+                    if _obs_age is None:
+                        _obs_age = out.meta.get("line_evidence_age_s")
+                    if _obs_age is not None and float(_obs_age) <= 0.2:
+                        self._hold_travel_m = 0.0
+                    else:
+                        self._hold_travel_m = (getattr(self, "_hold_travel_m",
+                                                       0.0)
+                                               + max(0.0, float(v)) * dt)
+                except Exception:
+                    _obs_age = None
+                # F-C（BEAMNG_PLC_ON_SENSOR_LANE）：把规划路径先拉到感知车道
+                # 中心，**再**交给安全监控器评估——这样"被评估的"就是"将被执行
+                # 的"路径。实测（12 次 town、999 个感知车道帧）：路径离车道中心
+                # 中位 0.773 m、62% 的帧 >0.5 m，而 PLC 校正器在 lane_src==sensor
+                # 时被整段关掉；ref_gap_m 全 0 证明偏差出在路径本身，不是两层参考
+                # 不一致。门的偏差用**上一 tick 实测**的 lane_dev_m（本 tick 的评估
+                # 还没发生），测不到就弃权。
+                try:
+                    if PLC_ON_SENSOR_LANE and best is not None                             and len(best) >= 2                             and str(out.meta.get("lane_src_sel", "")) == "sensor":
+                        _plc_pre_active = painted_line_correction_active(
+                            "sensor", "fsd", None, END_PULL_START_M,
+                            path_dev_m=getattr(self, "_last_lane_dev_m", None),
+                            on_sensor_lane=True)
+                        _sem1 = (out.head_outputs.get("semantic")
+                                 if getattr(out, "head_outputs", None) else None)
+                        if _plc_pre_active and _sem1 is not None                                 and out.cam is not None:
+                            _olc1 = painted_line_lane_center(
+                                _sem1, out.cam, pos, float(heading),
+                                ground_z=(float(pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
+                                          if len(pos) > 2 else None),
+                                marks=_plmarks)
+                            _des1 = (plc_corr.desired_shift(
+                                _olc1, pos, float(heading),
+                                max_shift_m=PLC_MAX_SHIFT_M)
+                                if _olc1 is not None else None)
+                            _shift1 = plc_corr.update(_des1, dt, v)
+                            self._plc_pre_shift = float(_shift1)
+                            if abs(_shift1) >= PLC_MIN_ENGAGE_M:
+                                _pre = np.asarray(best, dtype=float)
+                                _pre_shifted = plc_corr.apply(
+                                    _pre, pos, float(heading))
+                                if _pre_shifted is not None                                         and len(_pre_shifted) >= 2:
+                                    best = _pre_shifted
+                                    out.meta["plc_pre_shift_m"] = round(
+                                        float(_shift1), 3)
+                except Exception as _plc_pre_e:
+                    # 静默 except 曾把 NameError（开关没 import）藏了一整轮 A/B：
+                    # 记录到遥测，让"没生效"能看出来。
+                    out.meta["plc_pre_error"] = (f"{type(_plc_pre_e).__name__}: "
+                                                 f"{_plc_pre_e}")
                 _strict_perc = _strict_lane
                 scene = getattr(out, "scene", None)
                 if scene is not None:
@@ -2748,7 +2937,35 @@ class FSDriveSession:
                     verd = monitor.evaluate(
                         scene, best, planner_age_s=0.0,
                         snapshot_age_s=_sensor_snapshot_age(out),
-                        ego_speed_mps=v)
+                        ego_speed_mps=v,
+                        observation_age_s=_obs_age,
+                        travelled_since_obs_m=getattr(
+                            self, "_hold_travel_m", None))
+                # F-C 步骤 0（只读诊断）：0.77 m 的"路径离车道中心"必须能归因——
+                # 是规划器自己的路径偏，还是两层用的参考不一致。
+                try:
+                    from beamng_autopilot.planning.geometry import (
+                        polyline_point_distances,
+                    )
+                    _plan_ref = (np.asarray(out.lane_ref, dtype=float)
+                                 if out.lane_ref is not None else None)
+                    _mon_ref = (np.asarray(scene.lane_ref, dtype=float)
+                                if getattr(scene, "lane_ref", None) is not None
+                                else None)
+                    _b = (np.asarray(best, dtype=float)
+                          if best is not None and len(best) >= 2 else None)
+                    out.meta["plan_dev_m"] = (
+                        round(float(np.median(polyline_point_distances(
+                            _b[:, :2], _plan_ref[:, :2]))), 3)
+                        if _b is not None and _plan_ref is not None
+                        and len(_plan_ref) >= 2 else None)
+                    out.meta["ref_gap_m"] = (
+                        round(float(np.median(polyline_point_distances(
+                            _plan_ref[:, :2], _mon_ref[:, :2]))), 3)
+                        if _plan_ref is not None and _mon_ref is not None
+                        and len(_mon_ref) >= 2 else None)
+                except Exception:
+                    pass
                 else:
                     grid = OccupancyGrid(stack.grid_n, stack.grid_n,
                                          stack.grid_res,
@@ -2791,7 +3008,16 @@ class FSDriveSession:
                             ego_speed_mps=v)
                     else:
                         scene = Scene(pos=pos, heading=heading)
-                        verd = monitor.evaluate(scene, best)
+                        verd = monitor.evaluate(
+                            scene, best, observation_age_s=_obs_age,
+                            travelled_since_obs_m=getattr(
+                                self, "_hold_travel_m", None))
+                # 本 tick 实测的"路径 vs 车道参考"（无符号），供**下一 tick** 的
+                # F-C 门使用（本 tick 的门在评估之前就要用，只能取上一 tick 的
+                # 实测值——偏差是持续的地图车道偏置，不是逐帧噪声）。必须在
+                # verdict 之后、且**每个 tick** 都赋值：晚段那段只在"已选中路径"
+                # 的 tick 才跑，实测 0/4 帧拿到值 → 门全弃权（2026-10-06 A/B）。
+                self._last_lane_dev_m = getattr(verd, "lane_dev_m", None)
                 # Bounded PATH_HOLD offer (plan phase B): cache the FSD
                 # path whenever this tick's verdict is drivable on FRESH
                 # sensors - the hold is the bounded reuse of exactly this
@@ -3008,18 +3234,14 @@ class FSDriveSession:
                         HOLD_JOINT_GATE, audit_hold)
                     from beamng_autopilot.obstacle_risk import (
                         RISK_BRAKE_DECEL_MPS2)
+                    # ``_obs_age`` / ``_hold_travel_m`` were computed before
+                    # the arbitration (the monitor consults the same T09
+                    # contract); re-deriving them here would count the
+                    # travel twice.
                     _sh = out.meta.get("lane_shadow") or {}
-                    _obs_age = (_sh.get("age_since_update_s")
-                                if isinstance(_sh, dict) else None)
                     if _obs_age is None:
                         _obs_age = out.meta.get("line_evidence_age_s")
-                    # accumulated travel since the last fresh observation
-                    if getattr(verd, "fresh_reference", False) or                             (_obs_age is not None and _obs_age <= 0.2):
-                        self._hold_travel_m = 0.0
-                    else:
-                        self._hold_travel_m = (getattr(self, "_hold_travel_m",
-                                                       0.0)
-                                               + max(0.0, float(v)) * dt)
+
                     # A filter that has not measured yet carries INIT
                     # covariances, not measured ones: reporting those as a
                     # failed condition would blame the car for a number
@@ -3293,7 +3515,12 @@ class FSDriveSession:
                                     max_shift_m=PLC_MAX_SHIFT_M)
                     except Exception:
                         pass
-                    _plc_shift = plc_corr.update(_plc_desired, dt, v)
+                    if self._plc_pre_shift is not None:
+                        # 前置位移已在同一 tick 推进过限速器（F-C），这里只复用，
+                        # 不再 update 一次。
+                        _plc_shift = float(self._plc_pre_shift)
+                    else:
+                        _plc_shift = plc_corr.update(_plc_desired, dt, v)
                     if steer_path is not None \
                             and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
                         _steer_pre_plc = steer_path
@@ -4282,6 +4509,9 @@ class FSDriveSession:
                                           float(_authority_cap)))
                     _steer_final_clamped = True
                     steer_shaper.force_state(steer)
+                if _wall_hit():
+                    _run_record.update(exit_code=4, termination="drive_wall_timeout")
+                    break
                 _sent = _commands.send(
                     throttle=thr, brake=brk, steering=steer,
                     gear=gear_use, parkingbrake=pb)
@@ -4861,6 +5091,8 @@ class FSDriveSession:
                     # finished" from "finished but not published".
                     "head_sched": out.meta.get("head_sched"),
                     "range_sched": out.meta.get("range_sched"),
+                    "range_timing": out.meta.get("range_timing"),
+                    "range_age_basis": out.meta.get("range_age_basis"),
                     # Line-evidence provenance (plan phase E3): the fused
                     # line mask keeps historical support, and these say
                     # how much of it is fresh observation vs. held
@@ -4903,6 +5135,10 @@ class FSDriveSession:
                     # NOT the same as 0.0 = aligned.
                     "lane_dev_m": (None if getattr(verd, "lane_dev_m", None) is None
                                    else round(float(verd.lane_dev_m), 3)),
+                    # F-C 步骤 0 诊断（只读）：规划器路径 vs 规划器参考，
+                    # 以及规划器参考 vs 监控器参考（0.77 m 偏差归因用）。
+                    "plan_dev_m": out.meta.get("plan_dev_m"),
+                    "ref_gap_m": out.meta.get("ref_gap_m"),
                     "lat_left": lat_left,
                     "lat_right": lat_right,
                     "kind": str(out.meta.get("planner", {}).get("kind", "?")),
@@ -5009,6 +5245,8 @@ class FSDriveSession:
                     "line_lat": line_lat,
                     "plc_active": int(_plc_active),
                     "plc_shift": round(float(_plc_shift), 3),
+                    "plc_pre_shift_m": out.meta.get("plc_pre_shift_m"),
+                    "plc_pre_error": out.meta.get("plc_pre_error"),
                     "plc_desired": (round(float(_plc_desired), 3)
                                     if _plc_desired is not None else None),
                     "end_ref": _end_ref,
@@ -5017,6 +5255,22 @@ class FSDriveSession:
                     "route_bear": _ref_bearing(route_local, pos),
                     "best_bear": _ref_bearing(out.best_path, pos),
                 })
+                if getattr(args, "probe_geometry", False):
+                    _geometry_t0 = time.monotonic()
+                    try:
+                        from beamng_autopilot.geometry_probe import capture_tick
+                        hist[-1]["geometry_probe"] = capture_tick(
+                            out, pos=pos, heading=heading, selected_path=chosen.path,
+                            control_path=steer_path, verdict=verd,
+                            command={"cmd_seq": int(_cmd_seq), "cmd_t": _cmd_t,
+                                     "cmd_monotonic_t": _cmd_monotonic_t,
+                                     "throttle": thr, "brake": brk, "steering": steer,
+                                     "parkingbrake": pb, "gear": gear_use,
+                                     "consumed": _consumed})
+                    except Exception as exc:
+                        hist[-1]["geometry_probe"] = {
+                            "schema": "control-geometry-v1", "error": str(exc)}
+                    hist[-1]["geometry_probe_ms"] = 1000.0 * (time.monotonic() - _geometry_t0)
                 _sr_prev = float(steer_shaper.rate)
                 # --- control sub-steps (plan phases A2/A4) -------------
                 # The perception + planning tick above keeps its natural
@@ -5049,6 +5303,12 @@ class FSDriveSession:
                     _sub_until = min(_f0 + 1.0 / REALTIME_CTRL_HZ, t_end)
                     _sub_last = time.time()
                     while time.time() < _sub_until:
+                        if _wall_hit():
+                            _run_record.update(exit_code=4,
+                                               termination="drive_wall_timeout")
+                            _commands.send(throttle=0.0, brake=1.0, steering=0.0,
+                                           gear=fwd_gear, parkingbrake=1.0)
+                            break
                         _sub_t0 = time.time()
                         try:
                             _ss = conn.get_state()
@@ -5269,6 +5529,16 @@ class FSDriveSession:
                 except Exception as _rec_e:
                     print(f"[fsd-drive] shadow episode save failed: {_rec_e}")
         finally:
+            if sys.exc_info()[0] is not None:
+                _run_record.update(exit_code=2, termination="exception",
+                                   error=str(sys.exc_info()[1]))
+            elif locals().get("watchdog_lost", False):
+                _run_record.update(exit_code=2, termination="watchdog_lost")
+            if _drive_monotonic_t is not None:
+                _run_record["drive_elapsed_s"] = max(
+                    0.0, time.monotonic() - _drive_monotonic_t)
+            _run_record["wall_elapsed_s"] = max(0.0, time.monotonic() - _wall_t0)
+            _run_record["telemetry_frames"] = len(hist)
             # input watchdog must always be lifted, even on a crash, so a
             # later attach is not blocked by a stale Lua-frame timer
             try:
@@ -5289,7 +5559,10 @@ class FSDriveSession:
                 stack.close()
             except Exception:
                 pass
-            conn.close()
+            try:
+                conn.close()
+            except Exception as _close_e:
+                _run_record["connection_close_error"] = str(_close_e)
             # 关掉本次自己起的游戏（只关差集 + 创建时间校验；--attach 不碰）
             if _pids_before is not None and _launch_t is not None:
                 try:
@@ -5297,12 +5570,15 @@ class FSDriveSession:
                         close_started_game,
                     )
                     _gc = close_started_game(_pids_before,
-                                             launched_after=_launch_t)
+                                             launched_after=_launch_t,
+                                             verify_timeout_s=10.0)
+                    _run_record["cleanup"] = _gc
                     print(f"[fsd-drive] 收尾关游戏：closed="
                           f"{_gc.get('closed')} killed={_gc.get('killed')} "
                           f"{_gc.get('reason') or _gc.get('note') or ''}",
                           flush=True)
                 except Exception as _gc_e:
+                    _run_record["cleanup"] = {"closed": False, "reason": str(_gc_e)}
                     print(f"[fsd-drive] 收尾关游戏失败（不吞）：{_gc_e}",
                           flush=True)
             if (_vis_index or []) and args.out:
@@ -5322,7 +5598,24 @@ class FSDriveSession:
                     print(f"[fsd-drive] telemetry -> {args.out} ({len(hist)} frames)")
                 except Exception as _e:
                     print(f"[fsd-drive] telemetry write failed: {_e}")
-        return 2 if watchdog_lost else 0
+            if args.out:
+                try:
+                    _run_record["source_after"] = source_snapshot(config.PROJECT_ROOT)
+                    _run_record["source_unchanged"] = (
+                        _run_record["source_before"]["complete"]
+                        and _run_record["source_after"]["complete"]
+                        and _run_record["source_before"]["sha256"]
+                        == _run_record["source_after"]["sha256"])
+                    _audit_path = Path(str(args.out) + ".session.json")
+                    _audit_path.parent.mkdir(parents=True, exist_ok=True)
+                    _audit_tmp = _audit_path.with_suffix(".json.tmp")
+                    _audit_tmp.write_text(json.dumps(
+                        _run_record, ensure_ascii=False, indent=2), encoding="utf-8")
+                    os.replace(_audit_tmp, _audit_path)
+                except Exception as _audit_e:
+                    print(f"[fsd-drive] session audit write failed: {_audit_e}",
+                          flush=True)
+        return int(_run_record["exit_code"])
 
 
 def run(args) -> int:
